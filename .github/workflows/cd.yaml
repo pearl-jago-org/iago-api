@@ -1,0 +1,96 @@
+name: CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Tag de la imagen Docker subida a ECR"
+        required: true
+
+jobs:
+
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Configurar AWS
+        run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set default.region eu-west-1
+
+      - name: Login to ECR
+        run: |
+          aws ecr get-login-password --region eu-west-1 \
+            | docker login --username AWS --password-stdin ${{ secrets.ECR_URL }}
+
+      - name: Build and push image
+        id: build
+        run: |
+          IMAGE_URI="${{ secrets.ECR_URL }}/iago-microservice:${{ github.run_number }}"
+          docker build -t $IMAGE_URI .
+          docker push $IMAGE_URI
+          echo "image=$IMAGE_URI" >> $GITHUB_OUTPUT
+
+      - name: Generar Task Definition dinámicamente
+        env:
+          ECR_URL: ${{ secrets.ECR_URL }}
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          ECS_EXECUTION_ROLE_ARN: ${{ secrets.ECS_EXECUTION_ROLE_ARN }}
+          ECS_TASK_ROLE_ARN: ${{ secrets.ECS_TASK_ROLE_ARN }}
+        run: |
+          cat <<EOF > taskdef_rendered.json
+          {
+            "family": "iago-microservice",
+            "networkMode": "awsvpc",
+            "requiresCompatibilities": ["FARGATE"],
+            "cpu": "256",
+            "memory": "512",
+            "executionRoleArn": "${{ secrets.ECS_EXECUTION_ROLE_ARN }}",
+            "taskRoleArn": "${{ secrets.ECS_TASK_ROLE_ARN }}",
+            "containerDefinitions": [
+              {
+                "name": "iago-microservice",
+                "image": "${{ steps.build.outputs.image }}",
+                "essential": true,
+                "portMappings": [
+                  {
+                    "containerPort": 8080,
+                    "protocol": "tcp"
+                  }
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/iago-microservice",
+                    "awslogs-region": "eu-west-1",
+                    "awslogs-stream-prefix": "ecs"
+                  }
+                }
+              }
+            ]
+          }
+          EOF
+
+      - name: Registrar nueva Task Definition
+        run: |
+          aws ecs register-task-definition \
+            --cli-input-json file://taskdef_rendered.json
+
+      - name: Desplegar nueva revisión en ECS
+        run: |
+          aws ecs update-service \
+            --cluster iago-dev-cluster \
+            --service iago-dev-service \
+            --force-new-deployment \
+            --region eu-west-1
+            
+      - name: Esperar a que ECS esté estable
+        run: |
+          aws ecs wait services-stable \
+            --cluster iago-dev-cluster \
+            --services iago-dev-service \
+            --region eu-west-1

@@ -1,0 +1,141 @@
+name: CI_PROMOTE_DEV
+
+on:
+  push:
+    branches: [ "development" ]
+  pull_request:
+
+jobs:
+  sonar:
+    runs-on: [self-hosted]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Cache Maven
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Run tests
+        run: mvn -B test
+
+      - name: SonarQube Analysis (Maven)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Requerido por Sonar para obtener info de los PRs
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mvn -B verify sonar:sonar \
+            -Dsonar.projectKey=java_micro \
+            -Dsonar.host.url=http://sonarqube-local:9000 \
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+
+
+  security_and_image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache Maven
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Preload Maven dependencies
+        run: mvn -B dependency:resolve
+
+      # SAST
+      - name: Semgrep SAST
+        uses: returntocorp/semgrep-action@v1
+        env:
+          HOME: /tmp
+
+      # SCA (Trivy fs)
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scanners: vuln
+          scan-type: fs
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      # Docker build
+      - name: Build Docker image
+        run: |
+          docker build -t iago-microservice:${{ github.run_number }} .
+
+      # Docker image scan
+      - name: Scan Docker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: iago-microservice:${{ github.run_number }}
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+  build-and-promote:
+    needs: [sonar, security_and_image]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout microservice repo
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-west-1
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        run: |
+          IMAGE_URI=058264433602.dkr.ecr.eu-west-1.amazonaws.com/iago-micro
+          TAG=$(git rev-parse --short HEAD)
+          docker build -t $IMAGE_URI:$TAG .
+
+      - name: Push Docker image
+        run: |
+          IMAGE_URI=058264433602.dkr.ecr.eu-west-1.amazonaws.com/iago-micro
+          TAG=$(git rev-parse --short HEAD)
+          docker push $IMAGE_URI:$TAG
+
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v4
+        with:
+          repository: pearl-jago-org/argocd
+          token: ${{ secrets.GH_PAT}}
+          path: gitops
+
+      - name: Update image tag in GitOps repo
+        run: |
+          TAG=$(git rev-parse --short HEAD)
+          cd gitops/env/dev/iago-micro
+          yq -i "
+            .images[0].name = \"058264433602.dkr.ecr.eu-west-1.amazonaws.com/iago-micro\" |
+            .images[0].newTag = \"$TAG\"
+          " kustomization.yaml
+
+      - name: Commit and push changes
+        run: |
+          cd gitops
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "Promote iago-micro to dev: $TAG"
+          git push

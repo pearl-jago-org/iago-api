@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  #push:
+    #branches: [ "development" ]
+  pull_request:
+
+jobs:
+  sonar:
+    runs-on: [self-hosted]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Cache Maven
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Run tests
+        run: mvn -B test
+
+      - name: SonarQube Analysis (Maven)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # Requerido por Sonar para obtener info de los PRs
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          mvn -B verify sonar:sonar \
+            -Dsonar.projectKey=java_micro \
+            -Dsonar.host.url=http://sonarqube-local:9000 \
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+
+
+  security_and_image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # SAST
+      - name: Semgrep SAST
+        uses: returntocorp/semgrep-action@v1
+        env:
+          HOME: /tmp
+
+      # SCA (Trivy fs)
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scanners: vuln
+          scan-type: fs
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+      # Docker build
+      - name: Build Docker image
+        run: |
+          docker build -t iago-microservice:${{ github.run_number }} .
+
+      # Docker image scan
+      - name: Scan Docker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: iago-microservice:${{ github.run_number }}
+          severity: HIGH,CRITICAL
+          exit-code: 1
+
+  trigger_cd:
+    runs-on: ubuntu-latest
+    needs: [sonar, security_and_image]
+    steps:
+      - name: Trigger CD pipeline
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/cd.yaml/dispatches \
+            -d '{
+              "ref": "development",
+              "inputs": {
+                "image_tag": "${{ github.run_number }}"
+              }
+            }'
