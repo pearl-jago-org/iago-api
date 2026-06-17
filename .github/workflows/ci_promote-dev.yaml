@@ -72,19 +72,25 @@ jobs:
           severity: HIGH,CRITICAL
           exit-code: 1
 
-      # Docker build
+     # Docker build
       - name: Build Docker image
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          echo $GHCR_TOKEN | docker login ghcr.io -u $GHCR_USERNAME --password-stdin
           docker build -t ${{ github.event.repository.name }}:${{ github.run_number }} .
-
+      
       # Docker image scan
       - name: Scan Docker image
+        env:
+          GHCR_TOKEN: ${{ secrets.GH_PAT }}
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ github.event.repository.name }}:${{ github.run_number }}
           severity: HIGH,CRITICAL
           exit-code: 1
-
+ 
   build-and-promote:
     needs: [sonar, security_and_image]
     runs-on: ubuntu-latest
